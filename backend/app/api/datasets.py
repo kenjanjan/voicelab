@@ -26,6 +26,7 @@ class ClipOut(BaseModel):
 class ClipPatch(BaseModel):
     emotion: str | None = None
     is_reference: bool | None = None
+    text: str | None = None
 
 
 @router.post("/{creator_id}/upload")
@@ -94,8 +95,21 @@ def update_clip(
         clip.emotion = body.emotion or None
     if body.is_reference is not None:
         clip.is_reference = body.is_reference
+    if body.text is not None:
+        clip.text = body.text
     db.commit()
     return ClipOut(
         id=clip.id, path=clip.path, text=clip.text, emotion=clip.emotion,
         duration=clip.duration, is_reference=clip.is_reference,
     )
+
+
+@router.delete("/clips/{clip_id}", status_code=204)
+def delete_clip(clip_id: int, db: Session = Depends(get_session)) -> None:
+    clip = db.get(AudioClip, clip_id)
+    if not clip:
+        raise HTTPException(404, "Clip not found")
+    audio_path = settings.DATA_DIR / clip.path
+    audio_path.unlink(missing_ok=True)
+    db.delete(clip)
+    db.commit()

@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import creators, datasets, training, tts
+from app.api import creators, datasets, system, training, tts
 from app.core.config import settings
 from app.db import init_db
 
@@ -25,6 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(system.router, prefix="/api/system", tags=["system"])
 app.include_router(creators.router, prefix="/api/creators", tags=["creators"])
 app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 app.include_router(training.router, prefix="/api/training", tags=["training"])

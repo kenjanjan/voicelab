@@ -99,20 +99,32 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
               <thead className="text-left text-[var(--color-muted)]">
                 <tr>
                   <th className="py-2">Clip</th>
-                  <th>Transcript</th>
+                  <th>Transcript (click to edit)</th>
                   <th>Sec</th>
                   <th>Emotion</th>
-                  <th>Reference</th>
+                  <th>Ref</th>
                   <th>Preview</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 {clips.data.map((c) => (
                   <tr key={c.id} className="border-t border-[var(--color-border)]">
-                    <td className="py-2 font-mono text-xs">{c.id}</td>
-                    <td className="max-w-[18rem] truncate" title={c.text}>{c.text || "—"}</td>
-                    <td>{c.duration.toFixed(1)}</td>
-                    <td>
+                    <td className="py-2 font-mono text-xs align-top">{c.id}</td>
+                    <td className="align-top pr-3">
+                      <textarea
+                        defaultValue={c.text}
+                        rows={2}
+                        onBlur={(e) => {
+                          if (e.target.value !== c.text) {
+                            api.patchClip(c.id, { text: e.target.value });
+                          }
+                        }}
+                        className="w-full min-w-[20rem] bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 text-xs"
+                      />
+                    </td>
+                    <td className="align-top">{c.duration.toFixed(1)}</td>
+                    <td className="align-top">
                       <select
                         defaultValue={c.emotion ?? ""}
                         onChange={(e) => api.patchClip(c.id, { emotion: e.target.value || null })}
@@ -122,14 +134,27 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
                         {EMOTIONS.map((e) => <option key={e} value={e}>{e}</option>)}
                       </select>
                     </td>
-                    <td>
+                    <td className="align-top">
                       <input
                         type="checkbox" defaultChecked={c.is_reference}
                         onChange={(e) => api.patchClip(c.id, { is_reference: e.target.checked })}
                       />
                     </td>
-                    <td>
+                    <td className="align-top">
                       <audio controls src={`/files/${c.path}`} className="h-8" />
+                    </td>
+                    <td className="align-top">
+                      <button
+                        onClick={async () => {
+                          if (!confirm(`Delete clip ${c.id}?`)) return;
+                          await api.deleteClip(c.id);
+                          clips.mutate();
+                        }}
+                        className="text-[var(--color-muted)] hover:text-red-400 px-2"
+                        title="Delete clip"
+                      >
+                        ×
+                      </button>
                     </td>
                   </tr>
                 ))}
