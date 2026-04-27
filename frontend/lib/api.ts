@@ -64,10 +64,33 @@ export const api = {
   ),
 };
 
-export async function uploadAudio(creatorId: string, files: File[]) {
-  const fd = new FormData();
-  files.forEach((f) => fd.append("files", f));
-  const res = await fetch(`/api/datasets/${creatorId}/upload`, { method: "POST", body: fd });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  return res.json() as Promise<{ saved: string[]; count: number }>;
+export function uploadAudio(
+  creatorId: string,
+  file: File,
+  onProgress?: (loaded: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<{ saved: string[]; count: number }> {
+  return new Promise((resolve, reject) => {
+    const fd = new FormData();
+    fd.append("files", file);
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/datasets/${creatorId}/upload`);
+    xhr.timeout = 0;
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { reject(new Error("invalid JSON response")); }
+      } else {
+        reject(new Error(`${xhr.status} ${xhr.responseText.slice(0, 300)}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.onabort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal?.addEventListener("abort", () => xhr.abort());
+    xhr.send(fd);
+  });
 }
