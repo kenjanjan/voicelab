@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/raw/*
+data/processed/*
+data/loras/*
+data/outputs/*
+!data/.gitkeep
+pretrained_models/
+vendor/
+*.db
+.DS_Store

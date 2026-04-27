@@ -1,0 +1,23 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+sqlalchemy>=2.0
+python-multipart>=0.0.12
+
+torch>=2.4
+torchaudio>=2.4
+soundfile>=0.12
+librosa>=0.10
+pyloudnorm>=0.1.1
+numpy<2.0
+
+faster-whisper>=1.0
+demucs>=4.0
+
+modelscope>=1.20
+huggingface-hub>=0.26
+transformers>=4.45
+peft>=0.13
+accelerate>=1.0
+bitsandbytes>=0.44 ; platform_system != "Darwin"
