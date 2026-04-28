@@ -63,9 +63,10 @@ def run_lora_training(
     epochs: int,
     learning_rate: float,
     rank: int,
+    device: str | None = None,
 ) -> None:
     _set_status(job_id, status="running", started_at=datetime.utcnow(), progress=0.01)
-    _append_log(job_id, f"Starting LoRA training rank={rank} lr={learning_rate} epochs={epochs}")
+    _append_log(job_id, f"Starting LoRA training rank={rank} lr={learning_rate} epochs={epochs} device={device or 'auto'}")
 
     try:
         manifest = _build_manifest(creator_id)
@@ -86,7 +87,11 @@ def run_lora_training(
 
         engine = CosyVoice2(str(settings.COSYVOICE_MODEL.resolve()), load_jit=False, load_trt=False, fp16=False)
         lm = engine.model.llm
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else (
+                "mps" if torch.backends.mps.is_available() else "cpu"
+            )
+        _append_log(job_id, f"Using device: {device}")
         lm.to(device)
 
         lora_cfg = LoraConfig(

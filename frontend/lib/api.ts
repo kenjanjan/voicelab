@@ -18,9 +18,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type Device = { id: string; name: string; vram_gb: number | null };
+
 export type SystemStatus = {
   backend_ok: boolean;
-  gpu: { available: boolean; kind: string; name: string; vram_gb: number | null };
+  gpu: {
+    available: boolean; kind: string; name: string; vram_gb: number | null;
+    devices?: Device[];
+  };
   models: {
     cosyvoice_repo: boolean; cosyvoice_repo_path: string;
     cosyvoice_weights: boolean; cosyvoice_weights_path: string;
@@ -61,10 +66,18 @@ export const api = {
       if (!r.ok && r.status !== 204) throw new Error(`${r.status}`);
     }),
 
-  startTraining: (id: string, body: { epochs: number; learning_rate: number; rank: number }) =>
-    req<Job>(`/api/training/${id}/start`, { method: "POST", body: JSON.stringify(body) }),
+  startTraining: (
+    id: string,
+    body: { epochs: number; learning_rate: number; rank: number; device?: string | null },
+  ) => req<Job>(`/api/training/${id}/start`, { method: "POST", body: JSON.stringify(body) }),
   listJobs: (id: string) => req<Job[]>(`/api/training/${id}/jobs`),
   getJob: (jobId: string) => req<Job>(`/api/training/jobs/${jobId}`),
+  resetJob: (jobId: string) =>
+    req<Job>(`/api/training/jobs/${jobId}/reset`, { method: "POST" }),
+  resetPreprocess: (id: string) =>
+    req<{ status: string; progress: number; log: string; n_input: number; n_output: number }>(
+      `/api/datasets/${id}/preprocess/reset`, { method: "POST" },
+    ),
 
   emotions: () => req<string[]>("/api/tts/emotions"),
   synth: (body: {

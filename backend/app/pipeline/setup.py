@@ -51,19 +51,36 @@ def gpu_info() -> dict:
     try:
         import torch
         if torch.cuda.is_available():
-            i = 0
-            props = torch.cuda.get_device_properties(i)
+            n = torch.cuda.device_count()
+            devices = []
+            for i in range(n):
+                p = torch.cuda.get_device_properties(i)
+                devices.append({
+                    "id": f"cuda:{i}",
+                    "name": torch.cuda.get_device_name(i),
+                    "vram_gb": round(p.total_memory / 1e9, 1),
+                })
+            primary = devices[0]
             return {
-                "available": True,
-                "kind": "cuda",
-                "name": torch.cuda.get_device_name(i),
-                "vram_gb": round(props.total_memory / 1e9, 1),
+                "available": True, "kind": "cuda",
+                "name": primary["name"], "vram_gb": primary["vram_gb"],
+                "devices": devices + [{"id": "cpu", "name": "CPU (fallback)", "vram_gb": None}],
             }
         if torch.backends.mps.is_available():
-            return {"available": True, "kind": "mps", "name": "Apple Silicon (MPS)", "vram_gb": None}
-        return {"available": False, "kind": "cpu", "name": "CPU only", "vram_gb": None}
+            return {
+                "available": True, "kind": "mps",
+                "name": "Apple Silicon (MPS)", "vram_gb": None,
+                "devices": [
+                    {"id": "mps", "name": "Apple Silicon (MPS)", "vram_gb": None},
+                    {"id": "cpu", "name": "CPU (fallback)", "vram_gb": None},
+                ],
+            }
+        return {
+            "available": False, "kind": "cpu", "name": "CPU only", "vram_gb": None,
+            "devices": [{"id": "cpu", "name": "CPU", "vram_gb": None}],
+        }
     except Exception as e:
-        return {"available": False, "kind": "unknown", "name": str(e), "vram_gb": None}
+        return {"available": False, "kind": "unknown", "name": str(e), "vram_gb": None, "devices": []}
 
 
 def run_setup() -> None:

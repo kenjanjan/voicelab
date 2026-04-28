@@ -16,6 +16,7 @@ class TrainStart(BaseModel):
     epochs: int = 8
     learning_rate: float = 1e-4
     rank: int = 16
+    device: str | None = None  # e.g. "cuda:0", "cpu", "mps"
 
 
 class JobOut(BaseModel):
@@ -51,8 +52,27 @@ def start_training(
     db.add(job)
     db.commit()
 
-    bg.add_task(run_lora_training, job.id, creator_id, body.epochs, body.learning_rate, body.rank)
+    bg.add_task(
+        run_lora_training,
+        job.id, creator_id, body.epochs, body.learning_rate, body.rank, body.device,
+    )
     return _to_out(job)
+
+
+@router.post("/jobs/{job_id}/reset", response_model=JobOut)
+def reset_job(job_id: str, db: Session = Depends(get_session)) -> JobOut:
+    """Force a stuck job to 'failed'. Doesn't kill the subprocess (we don't track it),
+    but unblocks the UI from a state where the actual process is dead."""
+    j = db.get(TrainingJob, job_id)
+    if not j:
+        raise HTTPException(404, "Job not found")
+    if j.status in ("completed", "failed"):
+        return _to_out(j)
+    j.status = "failed"
+    j.log = (j.log or "") + "\n[manual reset]"
+    j.finished_at = datetime.utcnow()
+    db.commit()
+    return _to_out(j)
 
 
 @router.get("/{creator_id}/jobs", response_model=list[JobOut])

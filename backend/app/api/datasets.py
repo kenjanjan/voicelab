@@ -94,6 +94,24 @@ def preprocess_status(creator_id: str, db: Session = Depends(get_session)) -> di
     return read_preprocess_status(creator_id)
 
 
+@router.post("/{creator_id}/preprocess/reset")
+def reset_preprocess_status(creator_id: str, db: Session = Depends(get_session)) -> dict:
+    if not db.get(Creator, creator_id):
+        raise HTTPException(404, "Creator not found")
+    import json as _json
+    status_path = settings.DATA_DIR / "processed" / creator_id / "_status.json"
+    if status_path.exists():
+        try:
+            data = _json.loads(status_path.read_text())
+            if data.get("status") == "running":
+                data["status"] = "failed"
+                data["log"] = (data.get("log", "") or "") + "\n[manual reset]"
+                status_path.write_text(_json.dumps(data))
+        except Exception:
+            status_path.unlink(missing_ok=True)
+    return read_preprocess_status(creator_id)
+
+
 @router.post("/{creator_id}/preprocess")
 def trigger_preprocess(
     creator_id: str,

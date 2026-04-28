@@ -123,6 +123,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   const [epochs, setEpochs] = useState(8);
   const [rank, setRank] = useState(8);
   const [lr, setLr] = useState(1e-4);
+  const [device, setDevice] = useState<string>("");  // "" = auto
 
   const effEpochs = useAuto ? auto.epochs : epochs;
   const effRank = useAuto ? auto.rank : rank;
@@ -138,6 +139,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
     try {
       await api.startTraining(id, {
         epochs: effEpochs, learning_rate: effLr, rank: effRank,
+        device: device || null,
       });
       await jobs.mutate();
       setTab("training");
@@ -181,6 +183,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
         epochs: useAuto ? liveAuto.epochs : epochs,
         learning_rate: useAuto ? liveAuto.lr : lr,
         rank: useAuto ? liveAuto.rank : rank,
+        device: device || null,
       });
       await jobs.mutate();
       setTab("training");
@@ -291,6 +294,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
           ppRunning={ppRunning}
           totalRawSize={totalRawSize}
           onPreprocess={preprocess}
+          onResetPreprocess={async () => { await api.resetPreprocess(id); ppStatus.mutate(); }}
         />
       )}
 
@@ -302,6 +306,9 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
           epochs={effEpochs} setEpochs={setEpochs}
           rank={effRank} setRank={setRank}
           lr={effLr} setLr={setLr}
+          device={device} setDevice={setDevice}
+          devices={sys.data?.gpu.devices ?? []}
+          gpuKind={sys.data?.gpu.kind ?? "cpu"}
           onTrain={trainOnAll}
           onTrainQuick={startTraining}
           training={training}
@@ -377,7 +384,7 @@ type SWRPair<T> = {
 };
 
 function DatasetTab({
-  id, raw, clips, ppStatus, ppRunning, totalRawSize, onPreprocess,
+  id, raw, clips, ppStatus, ppRunning, totalRawSize, onPreprocess, onResetPreprocess,
 }: {
   id: string;
   raw: SWRPair<{ name: string; size: number }[]>;
@@ -386,6 +393,7 @@ function DatasetTab({
   ppRunning: boolean;
   totalRawSize: number;
   onPreprocess: () => void;
+  onResetPreprocess: () => Promise<void>;
 }) {
   return (
     <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
@@ -445,9 +453,22 @@ function DatasetTab({
           <Card>
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-sm font-semibold">Preprocess status</h3>
-              <span className={`text-xs px-2 py-0.5 rounded-full ${badge(ppStatus.data.status)}`}>
-                {ppStatus.data.status}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className={`text-xs px-2 py-0.5 rounded-full ${badge(ppStatus.data.status)}`}>
+                  {ppStatus.data.status}
+                </span>
+                {ppStatus.data.status === "running" && (
+                  <button
+                    onClick={async () => {
+                      if (confirm("Mark this preprocess job as failed? Use this only if it's actually stuck (e.g. backend was killed).")) {
+                        await onResetPreprocess();
+                      }
+                    }}
+                    className="text-xs text-amber-400 hover:text-amber-300"
+                    title="Force mark as failed"
+                  >reset</button>
+                )}
+              </div>
             </div>
             <div className="text-xs text-[var(--color-muted)] mb-2">
               files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
@@ -662,6 +683,7 @@ function ClipRow({ clip, onChange }: { clip: Clip; onChange: () => void }) {
 function TrainingTab({
   jobs, auto, useAuto, setUseAuto,
   epochs, setEpochs, rank, setRank, lr, setLr,
+  device, setDevice, devices, gpuKind,
   onTrain, onTrainQuick, training, pipelineStep, pipelineErr,
   clipsCount, rawCount,
 }: {
@@ -671,6 +693,9 @@ function TrainingTab({
   epochs: number; setEpochs: (v: number) => void;
   rank: number; setRank: (v: number) => void;
   lr: number; setLr: (v: number) => void;
+  device: string; setDevice: (v: string) => void;
+  devices: { id: string; name: string; vram_gb: number | null }[];
+  gpuKind: string;
   onTrain: () => void;
   onTrainQuick: () => void;
   training: boolean;
@@ -699,7 +724,7 @@ function TrainingTab({
           <p className="text-xs text-[var(--color-muted)] mb-2">{auto.reason}</p>
           {auto.warn && <p className="text-xs text-amber-400 mb-3">{auto.warn}</p>}
 
-          <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="grid grid-cols-3 gap-3 mb-3">
             <label className="text-xs">
               <div className="text-[var(--color-muted)] mb-1">Epochs</div>
               <input
@@ -725,6 +750,27 @@ function TrainingTab({
               />
             </label>
           </div>
+
+          <label className="text-xs block mb-4">
+            <div className="text-[var(--color-muted)] mb-1">Device</div>
+            <select
+              value={device}
+              onChange={(e) => setDevice(e.target.value)}
+              className="w-full bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 text-sm"
+            >
+              <option value="">Auto ({gpuKind === "cuda" ? "GPU" : gpuKind === "mps" ? "MPS" : "CPU"})</option>
+              {devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.id} — {d.name}{d.vram_gb ? ` (${d.vram_gb} GB)` : ""}
+                </option>
+              ))}
+            </select>
+            {gpuKind === "cpu" && (
+              <p className="text-amber-400 mt-1">
+                No GPU detected. Install CUDA torch in the venv: <span className="font-mono">pip uninstall -y torch torchaudio &amp;&amp; pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124</span>, then restart uvicorn.
+              </p>
+            )}
+          </label>
 
           <div className="flex flex-col gap-2">
             <Button
@@ -771,7 +817,14 @@ function TrainingTab({
           ) : (
             <ul className="space-y-3">
               {jobs.data.map((j) => (
-                <JobCard key={j.id} job={j} />
+                <JobCard
+                  key={j.id} job={j}
+                  onReset={async () => {
+                    if (!confirm(`Reset job ${j.id} to failed? Only do this if the actual process is dead (e.g. backend was killed).`)) return;
+                    await api.resetJob(j.id);
+                    jobs.mutate();
+                  }}
+                />
               ))}
             </ul>
           )}
@@ -781,9 +834,10 @@ function TrainingTab({
   );
 }
 
-function JobCard({ job }: { job: Job }) {
+function JobCard({ job, onReset }: { job: Job; onReset: () => Promise<void> }) {
   const lines = job.log ? job.log.split("\n").filter(Boolean) : [];
   const ts = (s: string | null) => s ? new Date(s).toLocaleString() : "—";
+  const stuck = job.status === "running" || job.status === "pending";
   return (
     <li className="border border-[var(--color-border)] rounded-md p-3">
       <div className="flex justify-between items-start gap-3">
@@ -794,9 +848,18 @@ function JobCard({ job }: { job: Job }) {
             {job.finished_at && ` · finished ${ts(job.finished_at)}`}
           </div>
         </div>
-        <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${badge(job.status)}`}>
-          {job.status}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${badge(job.status)}`}>
+            {job.status}
+          </span>
+          {stuck && (
+            <button
+              onClick={onReset}
+              className="text-xs text-amber-400 hover:text-amber-300"
+              title="Force mark as failed (use only if process is actually dead)"
+            >reset</button>
+          )}
+        </div>
       </div>
 
       <div className="mt-2 h-1.5 bg-[var(--color-bg)] rounded">
