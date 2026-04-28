@@ -198,21 +198,37 @@ def preprocess_creator(creator_id: str, force: bool = False) -> dict:
 
     raw_files = sorted([p for p in raw_dir.iterdir() if p.is_file()]) if raw_dir.exists() else []
 
-    # Resume detection
+    # Resume detection with fallback: if a marker is missing but clips already
+    # exist on disk + in DB, treat the file as done and write a marker.
     pending: list[Path] = []
     already_done: list[str] = []
+    fallback_marked: list[tuple[str, int]] = []
     for raw in raw_files:
-        if (completed_dir / raw.name).exists():
+        marker = completed_dir / raw.name
+        if marker.exists():
             already_done.append(raw.name)
-        else:
-            pending.append(raw)
+            continue
+        on_disk = list(out_dir.glob(f"{raw.stem}_*.wav"))
+        if on_disk:
+            prefix = _clip_path_prefix(creator_id, raw.stem)
+            with SessionLocal() as db:
+                existing = db.execute(
+                    select(func.count()).select_from(AudioClip).where(
+                        AudioClip.creator_id == creator_id,
+                        AudioClip.path.like(prefix + "%"),
+                    )
+                ).scalar_one()
+            if existing > 0:
+                marker.touch()
+                already_done.append(raw.name)
+                fallback_marked.append((raw.name, int(existing)))
+                continue
+        pending.append(raw)
 
-    # Initial status: progress accounts for already-done files
     n_total = len(raw_files)
     n_done = len(already_done)
     initial_progress = n_done / n_total if n_total else 0.0
 
-    # Count clips already in DB so n_output starts correctly
     with SessionLocal() as db:
         existing_count = db.execute(
             select(func.count()).select_from(AudioClip)
@@ -228,9 +244,16 @@ def preprocess_creator(creator_id: str, force: bool = False) -> dict:
     )
     _log(
         creator_id,
-        f"Starting preprocess. Total={n_total}, already_done={n_done}, pending={len(pending)} "
+        f"Starting preprocess. Total={n_total}, already_done={n_done} "
+        f"({len(fallback_marked)} via fallback), pending={len(pending)} "
         f"(force={force}, SR={SR}Hz)",
     )
+    if fallback_marked:
+        _log(creator_id, f"Fallback-marked (clips already in DB + on disk):")
+        for name, count in fallback_marked[:20]:
+            _log(creator_id, f"  - {name}: {count} clips")
+        if len(fallback_marked) > 20:
+            _log(creator_id, f"  ... and {len(fallback_marked) - 20} more")
 
     if not raw_files:
         _log(creator_id, "No raw files to process.")
