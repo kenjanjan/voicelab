@@ -84,6 +84,8 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   );
 
   const [training, setTraining] = useState(false);
+  const [pipelineStep, setPipelineStep] = useState<null | "preprocessing" | "waiting" | "starting">(null);
+  const [pipelineErr, setPipelineErr] = useState<string | null>(null);
   const [useAuto, setUseAuto] = useState(true);
   const [epochs, setEpochs] = useState(8);
   const [rank, setRank] = useState(8);
@@ -100,13 +102,69 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
 
   async function startTraining() {
     setTraining(true);
+    setPipelineErr(null);
     try {
       await api.startTraining(id, {
         epochs: effEpochs, learning_rate: effLr, rank: effRank,
       });
       await jobs.mutate();
+    } catch (e) {
+      setPipelineErr((e as Error).message);
     } finally {
       setTraining(false);
+    }
+  }
+
+  async function trainOnAll() {
+    setTraining(true);
+    setPipelineErr(null);
+    try {
+      let current = clips.data ?? [];
+
+      if (current.length < 20 && (raw.data?.length ?? 0) > 0) {
+        setPipelineStep("preprocessing");
+        await api.preprocess(id);
+
+        setPipelineStep("waiting");
+        const start = Date.now();
+        const TIMEOUT_MS = 30 * 60 * 1000;
+        while (Date.now() - start < TIMEOUT_MS) {
+          await new Promise((r) => setTimeout(r, 3000));
+          const fresh = await api.listClips(id);
+          await clips.mutate(fresh, { revalidate: false });
+          if (fresh.length >= 20) {
+            current = fresh;
+            break;
+          }
+        }
+        if (current.length < 20) {
+          throw new Error(`Timed out waiting for preprocessing. Got ${current.length} clips after preprocess; need ≥20.`);
+        }
+      }
+
+      if (current.length < 20) {
+        throw new Error(`Need ≥20 clips to train. Have ${current.length}. Upload more audio.`);
+      }
+
+      const liveAuto = autoLoraSettings(
+        current.length,
+        current.reduce((s, c) => s + c.duration, 0),
+        sys.data?.gpu.vram_gb ?? null,
+        sys.data?.gpu.kind ?? "cpu",
+      );
+
+      setPipelineStep("starting");
+      await api.startTraining(id, {
+        epochs: useAuto ? liveAuto.epochs : epochs,
+        learning_rate: useAuto ? liveAuto.lr : lr,
+        rank: useAuto ? liveAuto.rank : rank,
+      });
+      await jobs.mutate();
+    } catch (e) {
+      setPipelineErr((e as Error).message);
+    } finally {
+      setTraining(false);
+      setPipelineStep(null);
     }
   }
 
@@ -315,10 +373,33 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
               className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-28 disabled:opacity-60"
             />
           </label>
-          <Button onClick={startTraining} disabled={training || (clips.data?.length ?? 0) < 20}>
-            {training ? "Starting…" : "Start training"}
+          <Button
+            onClick={trainOnAll}
+            disabled={training || ((clips.data?.length ?? 0) < 20 && (raw.data?.length ?? 0) === 0)}
+          >
+            {pipelineStep === "preprocessing" ? "Preprocessing…" :
+             pipelineStep === "waiting" ? "Waiting for clips…" :
+             pipelineStep === "starting" ? "Starting training…" :
+             training ? "Working…" :
+             (clips.data?.length ?? 0) < 20 ? "Process + train all uploaded data" :
+             "Train on all clips"}
           </Button>
+          {(clips.data?.length ?? 0) >= 20 && (
+            <Button variant="secondary" onClick={startTraining} disabled={training}>
+              Train (skip preprocess)
+            </Button>
+          )}
         </div>
+
+        {pipelineErr && (
+          <p className="text-xs text-red-400 mb-3">Error: {pipelineErr}</p>
+        )}
+        {pipelineStep && (
+          <p className="text-xs text-[var(--color-muted)] mb-3">
+            Step: <span className="text-white">{pipelineStep}</span>
+            {pipelineStep === "waiting" && ` · ${clips.data?.length ?? 0} clips so far`}
+          </p>
+        )}
 
         {jobs.data && jobs.data.length > 0 ? (
           <ul className="space-y-2">
