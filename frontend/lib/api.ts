@@ -49,6 +49,11 @@ export const api = {
   listClips: (id: string) => req<Clip[]>(`/api/datasets/${id}/clips`),
   preprocess: (id: string) =>
     req<{ status: string }>(`/api/datasets/${id}/preprocess`, { method: "POST" }),
+  preprocessStatus: (id: string) =>
+    req<{
+      status: string; progress: number; log: string;
+      n_input: number; n_output: number;
+    }>(`/api/datasets/${id}/preprocess/status`),
   patchClip: (clipId: number, body: Partial<Pick<Clip, "emotion" | "is_reference" | "text">>) =>
     req<Clip>(`/api/datasets/clips/${clipId}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteClip: (clipId: number) =>

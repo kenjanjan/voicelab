@@ -69,12 +69,20 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
     (j) => j.status === "running" || j.status === "pending",
   ) ?? false;
 
+  const ppStatus = useSWR<{
+    status: string; progress: number; log: string;
+    n_input: number; n_output: number;
+  }>(`/api/datasets/${id}/preprocess/status`, () => api.preprocessStatus(id), {
+    refreshInterval: (d) => (d?.status === "running" ? 2000 : 30000),
+  });
+  const ppRunning = ppStatus.data?.status === "running";
+
   const raw = useSWR<{ name: string; size: number }[]>(
     `/api/datasets/${id}/raw`, () => api.listRaw(id),
     { refreshInterval: 60000 },
   );
   const clips = useSWR<Clip[]>(`/api/datasets/${id}/clips`, () => api.listClips(id), {
-    refreshInterval: anyJobActive ? 5000 : 60000,
+    refreshInterval: anyJobActive || ppRunning ? 5000 : 60000,
   });
 
   const sys = useSWR<SystemStatus>("/api/system/status", api.systemStatus, {
@@ -249,14 +257,43 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
           <Button
             variant="secondary"
             onClick={preprocess}
-            disabled={!raw.data || raw.data.length === 0}
+            disabled={!raw.data || raw.data.length === 0 || ppRunning}
           >
-            Run preprocessing
+            {ppRunning ? "Preprocessing…" : "Run preprocessing"}
           </Button>
           <span className="text-xs text-[var(--color-muted)]">
             denoise → 24 kHz mono → VAD → loudness norm → ASR. Re-running replaces all clips for this creator.
           </span>
         </div>
+
+        {ppStatus.data && ppStatus.data.status !== "idle" && (
+          <div className="mt-4 pt-4 border-t border-[var(--color-border)]">
+            <div className="flex items-center justify-between text-sm mb-2">
+              <span className="font-semibold">Preprocess status</span>
+              <span className={`text-xs px-2 py-0.5 rounded-full ${badge(ppStatus.data.status)}`}>
+                {ppStatus.data.status}
+              </span>
+            </div>
+            <div className="text-xs text-[var(--color-muted)] mb-2">
+              files: {ppStatus.data.n_input} · clips produced: {ppStatus.data.n_output} ·
+              progress: {Math.round(ppStatus.data.progress * 100)}%
+            </div>
+            <div className="h-1.5 bg-[var(--color-bg)] rounded mb-3">
+              <div
+                className="h-1.5 bg-[var(--color-accent)] rounded transition-all"
+                style={{ width: `${Math.round(ppStatus.data.progress * 100)}%` }}
+              />
+            </div>
+            <details className="text-xs">
+              <summary className="cursor-pointer text-[var(--color-muted)] hover:text-white">
+                Log ({(ppStatus.data.log.match(/\n/g)?.length ?? 0)} lines)
+              </summary>
+              <pre className="mt-2 text-[var(--color-muted)] max-h-64 overflow-auto whitespace-pre-wrap font-mono">
+                {ppStatus.data.log || "—"}
+              </pre>
+            </details>
+          </div>
+        )}
       </Card>
 
       <Card>
@@ -412,27 +449,46 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
 
         {jobs.data && jobs.data.length > 0 ? (
           <ul className="space-y-2">
-            {jobs.data.map((j) => (
-              <li key={j.id} className="border border-[var(--color-border)] rounded-md p-3">
-                <div className="flex justify-between text-sm">
-                  <span className="font-mono">{j.id}</span>
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${badge(j.status)}`}>
-                    {j.status}
-                  </span>
-                </div>
-                <div className="mt-2 h-1.5 bg-[var(--color-bg)] rounded">
-                  <div
-                    className="h-1.5 bg-[var(--color-accent)] rounded"
-                    style={{ width: `${Math.round(j.progress * 100)}%` }}
-                  />
-                </div>
-                {j.log && (
-                  <pre className="mt-2 text-xs text-[var(--color-muted)] max-h-32 overflow-auto whitespace-pre-wrap">
-                    {j.log.split("\n").slice(-8).join("\n")}
-                  </pre>
-                )}
-              </li>
-            ))}
+            {jobs.data.map((j) => {
+              const lines = j.log ? j.log.split("\n").filter(Boolean) : [];
+              const ts = (s: string | null) => s ? new Date(s).toLocaleTimeString() : "—";
+              return (
+                <li key={j.id} className="border border-[var(--color-border)] rounded-md p-3">
+                  <div className="flex justify-between items-start text-sm gap-3">
+                    <div>
+                      <div className="font-mono text-xs">{j.id}</div>
+                      <div className="text-xs text-[var(--color-muted)] mt-0.5">
+                        started {ts(j.started_at)}
+                        {j.finished_at && ` · finished ${ts(j.finished_at)}`}
+                      </div>
+                    </div>
+                    <span className={`text-xs px-2 py-0.5 rounded-full whitespace-nowrap ${badge(j.status)}`}>
+                      {j.status}
+                    </span>
+                  </div>
+                  <div className="mt-2 h-1.5 bg-[var(--color-bg)] rounded">
+                    <div
+                      className="h-1.5 bg-[var(--color-accent)] rounded transition-all"
+                      style={{ width: `${Math.round(j.progress * 100)}%` }}
+                    />
+                  </div>
+                  <div className="text-xs text-[var(--color-muted)] mt-1">
+                    {Math.round(j.progress * 100)}%
+                    {j.lora_path && ` · adapter: ${j.lora_path.split(/[\\/]/).slice(-2).join("/")}`}
+                  </div>
+                  {lines.length > 0 && (
+                    <details className="mt-2" open={j.status === "running" || j.status === "failed"}>
+                      <summary className="text-xs text-[var(--color-muted)] hover:text-white cursor-pointer">
+                        Log ({lines.length} lines)
+                      </summary>
+                      <pre className="mt-2 text-xs text-[var(--color-muted)] max-h-80 overflow-auto whitespace-pre-wrap font-mono bg-[var(--color-bg)] rounded p-2">
+                        {lines.slice(-200).join("\n")}
+                      </pre>
+                    </details>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         ) : (
           <p className="text-sm text-[var(--color-muted)]">No training runs yet.</p>

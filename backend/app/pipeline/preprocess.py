@@ -1,9 +1,11 @@
 """Denoise -> 24k mono -> VAD segment -> loudness norm -> ASR. Writes AudioClip rows."""
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 import librosa
@@ -22,6 +24,36 @@ MIN_DUR, MAX_DUR = 3.0, 12.0
 
 _vad = None
 _asr = None
+_demucs_warned = False
+
+
+def _status_path(creator_id: str) -> Path:
+    return settings.DATA_DIR / "processed" / creator_id / "_status.json"
+
+
+def read_status(creator_id: str) -> dict:
+    p = _status_path(creator_id)
+    if not p.exists():
+        return {"status": "idle", "progress": 0.0, "log": "", "n_input": 0, "n_output": 0}
+    try:
+        return json.loads(p.read_text())
+    except json.JSONDecodeError:
+        return {"status": "idle", "progress": 0.0, "log": "", "n_input": 0, "n_output": 0}
+
+
+def _write_status(creator_id: str, **fields) -> None:
+    p = _status_path(creator_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    current = read_status(creator_id)
+    current.update(fields)
+    p.write_text(json.dumps(current))
+
+
+def _log(creator_id: str, line: str) -> None:
+    print(f"[preprocess:{creator_id}] {line}")
+    cur = read_status(creator_id)
+    cur["log"] = (cur.get("log", "") + line + "\n")[-12000:]
+    _status_path(creator_id).write_text(json.dumps(cur))
 
 
 def _load_vad():
@@ -42,10 +74,11 @@ def _load_asr():
 
 
 def _denoise(in_path: Path, work: Path) -> Path:
+    global _demucs_warned
     out = work / "demucs"
     out.mkdir(parents=True, exist_ok=True)
     try:
-        r = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
              "-o", str(out), str(in_path)],
             check=True, capture_output=True, text=True,
@@ -53,8 +86,14 @@ def _denoise(in_path: Path, work: Path) -> Path:
         cleaned = out / "htdemucs" / in_path.stem / "vocals.wav"
         return cleaned if cleaned.exists() else in_path
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        msg = getattr(e, "stderr", "") or str(e)
-        print(f"[preprocess] denoise skipped for {in_path.name}: {msg[-300:]}")
+        if not _demucs_warned:
+            msg = (getattr(e, "stderr", "") or str(e))[-400:]
+            print(
+                "[preprocess] denoise unavailable — proceeding without it. "
+                "Install ffmpeg + `pip install torchcodec` to enable Demucs.\n"
+                f"  reason: {msg.strip()}"
+            )
+            _demucs_warned = True
         return in_path
 
 
@@ -104,33 +143,83 @@ def preprocess_creator(creator_id: str) -> dict:
     raw_dir = settings.DATA_DIR / "raw" / creator_id
     out_dir = settings.DATA_DIR / "processed" / creator_id
     work_dir = out_dir / "_work"
+
     if out_dir.exists():
-        shutil.rmtree(out_dir)
+        for sub in out_dir.iterdir():
+            if sub.name == "_status.json":
+                continue
+            if sub.is_dir():
+                shutil.rmtree(sub, ignore_errors=True)
+            else:
+                sub.unlink(missing_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    asr = _load_asr()
-    new_clips: list[AudioClip] = []
+    raw_files = sorted([p for p in raw_dir.iterdir() if p.is_file()]) if raw_dir.exists() else []
+    _write_status(
+        creator_id, status="running", progress=0.0, log="",
+        n_input=len(raw_files), n_output=0,
+    )
+    _log(creator_id, f"Starting preprocess of {len(raw_files)} files (SR={SR} Hz)")
 
-    for raw in sorted(raw_dir.iterdir()):
-        if not raw.is_file():
+    if not raw_files:
+        _log(creator_id, "No raw files to process.")
+        _write_status(creator_id, status="completed", progress=1.0)
+        return {"clips": 0}
+
+    try:
+        asr = _load_asr()
+        _log(creator_id, "ASR (faster-whisper large-v3) loaded.")
+    except Exception as e:
+        _log(creator_id, f"ASR load FAILED: {e}\n{traceback.format_exc()}")
+        _write_status(creator_id, status="failed")
+        raise
+
+    new_clips: list[AudioClip] = []
+    n_files_failed = 0
+
+    for idx, raw in enumerate(raw_files):
+        _log(creator_id, f"[{idx+1}/{len(raw_files)}] {raw.name} ({raw.stat().st_size/1e6:.1f} MB)")
+        try:
+            cleaned = _denoise(raw, work_dir)
+        except Exception as e:
+            _log(creator_id, f"  denoise error (continuing on raw): {e}")
+            cleaned = raw
+
+        try:
+            wav = _to_mono_24k(cleaned)
+        except Exception as e:
+            _log(creator_id, f"  load FAILED: {e}")
+            n_files_failed += 1
             continue
-        cleaned = _denoise(raw, work_dir)
-        wav = _to_mono_24k(cleaned)
-        for i, (s, e) in enumerate(_vad_segments(wav)):
+
+        total_dur = len(wav) / SR
+        try:
+            segs = _vad_segments(wav)
+        except Exception as e:
+            _log(creator_id, f"  VAD FAILED: {e}\n{traceback.format_exc()}")
+            n_files_failed += 1
+            continue
+
+        n_dropped = 0
+        n_saved = 0
+        for i, (s, e) in enumerate(segs):
             seg = wav[s:e]
             dur = (e - s) / SR
             if dur < MIN_DUR:
+                n_dropped += 1
                 continue
             seg = _normalize(seg)
             clip_path = out_dir / f"{raw.stem}_{i:03}.wav"
             sf.write(str(clip_path), seg.numpy(), SR, subtype="PCM_16")
             text = ""
             try:
-                segments, _ = asr.transcribe(str(clip_path), language="en", vad_filter=False)
+                segments, _info = asr.transcribe(
+                    str(clip_path), language="en", vad_filter=False,
+                )
                 text = " ".join(seg_.text.strip() for seg_ in segments)
-            except Exception:
-                pass
+            except Exception as ex:
+                _log(creator_id, f"  ASR error on segment {i}: {ex}")
             new_clips.append(AudioClip(
                 creator_id=creator_id,
                 path=str(clip_path.relative_to(settings.DATA_DIR).as_posix()),
@@ -138,6 +227,16 @@ def preprocess_creator(creator_id: str) -> dict:
                 duration=round(dur, 2),
                 is_reference=False,
             ))
+            n_saved += 1
+
+        _log(
+            creator_id,
+            f"  duration={total_dur:.1f}s · VAD found {len(segs)} segments · "
+            f"saved {n_saved} · dropped {n_dropped} (<{MIN_DUR}s)",
+        )
+        _write_status(
+            creator_id, progress=(idx + 1) / len(raw_files), n_output=len(new_clips),
+        )
 
     shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -147,4 +246,12 @@ def preprocess_creator(creator_id: str) -> dict:
             db.add(c)
         db.commit()
 
+    _log(
+        creator_id,
+        f"DONE — {len(new_clips)} clips written from {len(raw_files)} files "
+        f"({n_files_failed} failed).",
+    )
+    _write_status(
+        creator_id, status="completed", progress=1.0, n_output=len(new_clips),
+    )
     return {"clips": len(new_clips)}

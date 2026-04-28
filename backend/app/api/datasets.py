@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db import AudioClip, Creator, get_session
-from app.pipeline.preprocess import preprocess_creator
+from app.pipeline.preprocess import preprocess_creator, read_status as read_preprocess_status
 
 router = APIRouter()
 
@@ -85,6 +85,13 @@ def delete_raw(creator_id: str, filename: str, db: Session = Depends(get_session
     if not target.is_file() or target.parent.resolve() != raw_dir.resolve():
         raise HTTPException(404, "File not found")
     target.unlink()
+
+
+@router.get("/{creator_id}/preprocess/status")
+def preprocess_status(creator_id: str, db: Session = Depends(get_session)) -> dict:
+    if not db.get(Creator, creator_id):
+        raise HTTPException(404, "Creator not found")
+    return read_preprocess_status(creator_id)
 
 
 @router.post("/{creator_id}/preprocess")
