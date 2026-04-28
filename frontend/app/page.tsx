@@ -9,7 +9,7 @@ import { api, SystemStatus } from "@/lib/api";
 export default function Home() {
   const { data, mutate, error, isLoading } = useSWR<SystemStatus>(
     "/api/system/status", api.systemStatus,
-    { refreshInterval: (d) => (d?.setup.status === "running" ? 1500 : 5000) },
+    { refreshInterval: (d) => (d?.setup.status === "running" ? 1500 : 30000) },
   );
   const [busy, setBusy] = useState(false);
 

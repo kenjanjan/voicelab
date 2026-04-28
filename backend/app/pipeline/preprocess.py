@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import librosa
@@ -45,7 +46,7 @@ def _denoise(in_path: Path, work: Path) -> Path:
     out.mkdir(parents=True, exist_ok=True)
     try:
         r = subprocess.run(
-            ["python", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+            [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
              "-o", str(out), str(in_path)],
             check=True, capture_output=True, text=True,
         )
@@ -69,15 +70,24 @@ def _to_mono_24k(path: Path) -> torch.Tensor:
 
 
 def _vad_segments(wav: torch.Tensor) -> list[tuple[int, int]]:
+    """Run silero VAD at 16 kHz (it requires 8k or multiples of 16k).
+
+    Returns sample-index tuples in the original SR (24 kHz) so callers can
+    slice the original tensor directly.
+    """
     model, utils = _load_vad()
     get_speech_timestamps = utils[0]
+    VAD_SR = 16000
+    wav_16k_np = librosa.resample(wav.numpy().astype(np.float32), orig_sr=SR, target_sr=VAD_SR)
+    wav_16k = torch.from_numpy(wav_16k_np)
     ts = get_speech_timestamps(
-        wav, model, sampling_rate=SR,
+        wav_16k, model, sampling_rate=VAD_SR,
         min_speech_duration_ms=2500,
         max_speech_duration_s=MAX_DUR,
         min_silence_duration_ms=400,
     )
-    return [(s["start"], s["end"]) for s in ts]
+    scale = SR / VAD_SR
+    return [(int(t["start"] * scale), int(t["end"] * scale)) for t in ts]
 
 
 def _normalize(wav: torch.Tensor) -> torch.Tensor:

@@ -61,17 +61,26 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   const creator = useSWR<Creator>(`/api/creators/${id}`, () =>
     fetch(`/api/creators/${id}`).then((r) => r.json()),
   );
+  const jobs = useSWR<Job[]>(`/api/training/${id}/jobs`, () => api.listJobs(id), {
+    refreshInterval: (data) =>
+      data?.some((j) => j.status === "running" || j.status === "pending") ? 3000 : 30000,
+  });
+  const anyJobActive = jobs.data?.some(
+    (j) => j.status === "running" || j.status === "pending",
+  ) ?? false;
+
   const raw = useSWR<{ name: string; size: number }[]>(
-    `/api/datasets/${id}/raw`, () => api.listRaw(id), { refreshInterval: 4000 },
+    `/api/datasets/${id}/raw`, () => api.listRaw(id),
+    { refreshInterval: 60000 },
   );
   const clips = useSWR<Clip[]>(`/api/datasets/${id}/clips`, () => api.listClips(id), {
-    refreshInterval: 4000,
-  });
-  const jobs = useSWR<Job[]>(`/api/training/${id}/jobs`, () => api.listJobs(id), {
-    refreshInterval: 3000,
+    refreshInterval: anyJobActive ? 5000 : 60000,
   });
 
-  const sys = useSWR<SystemStatus>("/api/system/status", api.systemStatus);
+  const sys = useSWR<SystemStatus>("/api/system/status", api.systemStatus, {
+    refreshInterval: 0,
+    revalidateOnFocus: false,
+  });
 
   const totalRawSize = (raw.data ?? []).reduce((s, f) => s + f.size, 0);
   const totalClipSec = (clips.data ?? []).reduce((s, c) => s + c.duration, 0);
@@ -97,7 +106,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
 
   async function preprocess() {
     await api.preprocess(id);
-    setTimeout(() => clips.mutate(), 500);
+    setTimeout(() => { clips.mutate(); raw.mutate(); }, 1500);
   }
 
   async function startTraining() {
