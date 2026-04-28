@@ -58,6 +58,7 @@ export const api = {
     req<{
       status: string; progress: number; log: string;
       n_input: number; n_output: number;
+      started_at: string | null; finished_at: string | null;
     }>(`/api/datasets/${id}/preprocess/status`),
   patchClip: (clipId: number, body: Partial<Pick<Clip, "emotion" | "is_reference" | "text">>) =>
     req<Clip>(`/api/datasets/clips/${clipId}`, { method: "PATCH", body: JSON.stringify(body) }),
@@ -75,9 +76,11 @@ export const api = {
   resetJob: (jobId: string) =>
     req<Job>(`/api/training/jobs/${jobId}/reset`, { method: "POST" }),
   resetPreprocess: (id: string) =>
-    req<{ status: string; progress: number; log: string; n_input: number; n_output: number }>(
-      `/api/datasets/${id}/preprocess/reset`, { method: "POST" },
-    ),
+    req<{
+      status: string; progress: number; log: string;
+      n_input: number; n_output: number;
+      started_at: string | null; finished_at: string | null;
+    }>(`/api/datasets/${id}/preprocess/reset`, { method: "POST" }),
 
   emotions: () => req<string[]>("/api/tts/emotions"),
   synth: (body: {

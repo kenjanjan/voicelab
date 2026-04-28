@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { use, useMemo, useState } from "react";
+import { use, useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -21,6 +21,41 @@ function fmtDuration(sec: number): string {
   if (sec < 60) return `${sec.toFixed(0)}s`;
   if (sec < 3600) return `${(sec / 60).toFixed(1)} min`;
   return `${(sec / 3600).toFixed(1)} hr`;
+}
+
+function fmtSeconds(s: number): string {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${sec}s`;
+}
+
+function progressTiming(
+  startedAt: string | null | undefined,
+  progress: number,
+  finishedAt: string | null | undefined,
+  status: string,
+): { elapsed: number | null; eta: number | null; total?: number | null } {
+  if (!startedAt) return { elapsed: null, eta: null };
+  const start = new Date(startedAt).getTime();
+  const end = finishedAt ? new Date(finishedAt).getTime() : Date.now();
+  const elapsed = Math.max(0, (end - start) / 1000);
+  if (status === "completed" || status === "failed") {
+    return { elapsed, eta: 0, total: elapsed };
+  }
+  const eta = progress > 0.02 ? (elapsed * (1 - progress)) / progress : null;
+  return { elapsed, eta };
+}
+
+function useTick(intervalMs: number) {
+  const [, setT] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setT((t) => t + 1), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
 }
 
 function autoLoraSettings(
@@ -77,6 +112,7 @@ type Tab = "dataset" | "training";
 export default function CreatorDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const [tab, setTab] = useState<Tab>("dataset");
+  useTick(1000); // re-render every second so elapsed/ETA stay live
 
   const creator = useSWR<Creator>(`/api/creators/${id}`, () =>
     fetch(`/api/creators/${id}`).then((r) => r.json()),
@@ -283,22 +319,42 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
         {/* Active job banner */}
         {(ppRunning || activeJob) && (
           <div className="mt-3 space-y-1">
-            {ppRunning && ppStatus.data && (
-              <ActivityBar
-                label="Preprocessing"
-                detail={`${ppStatus.data.n_output} clips so far · ${Math.round(ppStatus.data.progress * 100)}%`}
-                progress={ppStatus.data.progress}
-                onClick={() => setTab("dataset")}
-              />
-            )}
-            {activeJob && (
-              <ActivityBar
-                label={`Training ${activeJob.id}`}
-                detail={`${Math.round(activeJob.progress * 100)}% · ${activeJob.status}`}
-                progress={activeJob.progress}
-                onClick={() => setTab("training")}
-              />
-            )}
+            {ppRunning && ppStatus.data && (() => {
+              const t = progressTiming(
+                ppStatus.data.started_at, ppStatus.data.progress,
+                ppStatus.data.finished_at, ppStatus.data.status,
+              );
+              const detail =
+                `${ppStatus.data.n_output} clips · ${Math.round(ppStatus.data.progress * 100)}%` +
+                (t.elapsed != null ? ` · ${fmtSeconds(t.elapsed)} elapsed` : "") +
+                (t.eta != null ? ` · ETA ${fmtSeconds(t.eta)}` : "");
+              return (
+                <ActivityBar
+                  label="Preprocessing"
+                  detail={detail}
+                  progress={ppStatus.data.progress}
+                  onClick={() => setTab("dataset")}
+                />
+              );
+            })()}
+            {activeJob && (() => {
+              const t = progressTiming(
+                activeJob.started_at, activeJob.progress,
+                activeJob.finished_at, activeJob.status,
+              );
+              const detail =
+                `${Math.round(activeJob.progress * 100)}% · ${activeJob.status}` +
+                (t.elapsed != null ? ` · ${fmtSeconds(t.elapsed)} elapsed` : "") +
+                (t.eta != null ? ` · ETA ${fmtSeconds(t.eta)}` : "");
+              return (
+                <ActivityBar
+                  label={`Training ${activeJob.id}`}
+                  detail={detail}
+                  progress={activeJob.progress}
+                  onClick={() => setTab("training")}
+                />
+              );
+            })()}
           </div>
         )}
       </div>
@@ -513,8 +569,24 @@ function DatasetTab({
                 )}
               </div>
             </div>
-            <div className="text-xs text-[var(--color-muted)] mb-2">
-              files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
+            <div className="text-xs text-[var(--color-muted)] mb-2 space-y-0.5">
+              <div>
+                files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
+              </div>
+              {(() => {
+                const t = progressTiming(
+                  ppStatus.data.started_at, ppStatus.data.progress,
+                  ppStatus.data.finished_at, ppStatus.data.status,
+                );
+                if (t.elapsed == null) return null;
+                return (
+                  <div>
+                    elapsed {fmtSeconds(t.elapsed)}
+                    {ppStatus.data.status === "running" && t.eta != null && ` · ETA ${fmtSeconds(t.eta)} · finish ~${new Date(Date.now() + t.eta * 1000).toLocaleTimeString()}`}
+                    {ppStatus.data.status !== "running" && t.total != null && ` total · ${ppStatus.data.status}`}
+                  </div>
+                );
+              })()}
             </div>
             <div className="h-1.5 bg-[var(--color-bg)] rounded mb-3">
               <div
@@ -866,8 +938,24 @@ function TrainingTab({
                 {ppStatus.data.status}
               </span>
             </div>
-            <div className="text-xs text-[var(--color-muted)] mb-2">
-              files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
+            <div className="text-xs text-[var(--color-muted)] mb-2 space-y-0.5">
+              <div>
+                files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
+              </div>
+              {(() => {
+                const t = progressTiming(
+                  ppStatus.data.started_at, ppStatus.data.progress,
+                  ppStatus.data.finished_at, ppStatus.data.status,
+                );
+                if (t.elapsed == null) return null;
+                return (
+                  <div>
+                    elapsed {fmtSeconds(t.elapsed)}
+                    {ppStatus.data.status === "running" && t.eta != null && ` · ETA ${fmtSeconds(t.eta)} · finish ~${new Date(Date.now() + t.eta * 1000).toLocaleTimeString()}`}
+                    {ppStatus.data.status !== "running" && t.total != null && ` total · ${ppStatus.data.status}`}
+                  </div>
+                );
+              })()}
             </div>
             <div className="h-1.5 bg-[var(--color-bg)] rounded mb-3">
               <div
@@ -953,9 +1041,24 @@ function JobCard({ job, onReset }: { job: Job; onReset: () => Promise<void> }) {
           style={{ width: `${Math.round(job.progress * 100)}%` }}
         />
       </div>
-      <div className="text-xs text-[var(--color-muted)] mt-1">
-        {Math.round(job.progress * 100)}%
-        {job.lora_path && ` · adapter: ${job.lora_path.split(/[\\/]/).slice(-2).join("/")}`}
+      <div className="text-xs text-[var(--color-muted)] mt-1 space-y-0.5">
+        <div>
+          {Math.round(job.progress * 100)}%
+          {job.lora_path && ` · adapter: ${job.lora_path.split(/[\\/]/).slice(-2).join("/")}`}
+        </div>
+        {(() => {
+          const t = progressTiming(job.started_at, job.progress, job.finished_at, job.status);
+          if (t.elapsed == null) return null;
+          if (job.status === "running") {
+            return (
+              <div>
+                elapsed {fmtSeconds(t.elapsed)}
+                {t.eta != null && ` · ETA ${fmtSeconds(t.eta)} · finish ~${new Date(Date.now() + t.eta * 1000).toLocaleTimeString()}`}
+              </div>
+            );
+          }
+          return <div>total {fmtSeconds(t.elapsed)} · {job.status}</div>;
+        })()}
       </div>
 
       {lines.length > 0 && (

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import librosa
@@ -31,14 +32,26 @@ def _status_path(creator_id: str) -> Path:
     return settings.DATA_DIR / "processed" / creator_id / "_status.json"
 
 
+def _default_status() -> dict:
+    return {
+        "status": "idle", "progress": 0.0, "log": "",
+        "n_input": 0, "n_output": 0,
+        "started_at": None, "finished_at": None,
+    }
+
+
 def read_status(creator_id: str) -> dict:
     p = _status_path(creator_id)
     if not p.exists():
-        return {"status": "idle", "progress": 0.0, "log": "", "n_input": 0, "n_output": 0}
+        return _default_status()
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except json.JSONDecodeError:
-        return {"status": "idle", "progress": 0.0, "log": "", "n_input": 0, "n_output": 0}
+        return _default_status()
+    # backfill missing fields from older runs
+    base = _default_status()
+    base.update(data)
+    return base
 
 
 def _write_status(creator_id: str, **fields) -> None:
@@ -159,12 +172,17 @@ def preprocess_creator(creator_id: str) -> dict:
     _write_status(
         creator_id, status="running", progress=0.0, log="",
         n_input=len(raw_files), n_output=0,
+        started_at=datetime.utcnow().isoformat() + "Z",
+        finished_at=None,
     )
     _log(creator_id, f"Starting preprocess of {len(raw_files)} files (SR={SR} Hz)")
 
     if not raw_files:
         _log(creator_id, "No raw files to process.")
-        _write_status(creator_id, status="completed", progress=1.0)
+        _write_status(
+            creator_id, status="completed", progress=1.0,
+            finished_at=datetime.utcnow().isoformat() + "Z",
+        )
         return {"clips": 0}
 
     try:
@@ -172,7 +190,10 @@ def preprocess_creator(creator_id: str) -> dict:
         _log(creator_id, "ASR (faster-whisper large-v3) loaded.")
     except Exception as e:
         _log(creator_id, f"ASR load FAILED: {e}\n{traceback.format_exc()}")
-        _write_status(creator_id, status="failed")
+        _write_status(
+            creator_id, status="failed",
+            finished_at=datetime.utcnow().isoformat() + "Z",
+        )
         raise
 
     new_clips: list[AudioClip] = []
@@ -253,5 +274,6 @@ def preprocess_creator(creator_id: str) -> dict:
     )
     _write_status(
         creator_id, status="completed", progress=1.0, n_output=len(new_clips),
+        finished_at=datetime.utcnow().isoformat() + "Z",
     )
     return {"clips": len(new_clips)}
