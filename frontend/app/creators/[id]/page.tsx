@@ -119,6 +119,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   const [training, setTraining] = useState(false);
   const [pipelineStep, setPipelineStep] = useState<null | "preprocessing" | "waiting" | "starting">(null);
   const [pipelineErr, setPipelineErr] = useState<string | null>(null);
+  const [pipelineAborted, setPipelineAborted] = useState(false);
   const [useAuto, setUseAuto] = useState(true);
   const [epochs, setEpochs] = useState(8);
   const [rank, setRank] = useState(8);
@@ -151,28 +152,62 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   }
 
   async function trainOnAll() {
-    setTraining(true); setPipelineErr(null);
+    setTraining(true);
+    setPipelineErr(null);
+    setPipelineAborted(false);
     try {
       let current = clips.data ?? [];
+
       if (current.length < 20 && (raw.data?.length ?? 0) > 0) {
-        setPipelineStep("preprocessing");
-        await api.preprocess(id);
+        // Only kick off a new preprocess if one isn't already running
+        const initialStatus = await api.preprocessStatus(id);
+        if (initialStatus.status !== "running") {
+          setPipelineStep("preprocessing");
+          await api.preprocess(id);
+        } else {
+          // attach to the running one
+          setPipelineStep("waiting");
+        }
+
         setPipelineStep("waiting");
         const start = Date.now();
-        const TIMEOUT_MS = 30 * 60 * 1000;
+        const TIMEOUT_MS = 60 * 60 * 1000;
+
         while (Date.now() - start < TIMEOUT_MS) {
           await new Promise((r) => setTimeout(r, 3000));
-          const fresh = await api.listClips(id);
+          if (pipelineAborted) throw new Error("Cancelled by user");
+
+          const [fresh, freshStatus] = await Promise.all([
+            api.listClips(id),
+            api.preprocessStatus(id),
+          ]);
           await clips.mutate(fresh, { revalidate: false });
-          if (fresh.length >= 20) { current = fresh; break; }
+          await ppStatus.mutate(freshStatus, { revalidate: false });
+
+          if (fresh.length >= 20) {
+            current = fresh;
+            break;
+          }
+          if (freshStatus.status === "failed") {
+            throw new Error("Preprocess failed — check the Dataset tab → Preprocess status log.");
+          }
+          if (freshStatus.status === "completed") {
+            if (fresh.length < 20) {
+              throw new Error(`Preprocess finished but only produced ${fresh.length} clips. Need ≥20. Upload more audio or check the log for VAD issues.`);
+            }
+            current = fresh;
+            break;
+          }
         }
         if (current.length < 20) {
-          throw new Error(`Timed out waiting for preprocessing. Got ${current.length} clips; need ≥20.`);
+          throw new Error(`Timed out after 60 min. Got ${current.length} clips.`);
         }
       }
+
       if (current.length < 20) {
         throw new Error(`Need ≥20 clips. Have ${current.length}. Upload more audio.`);
       }
+
       const liveAuto = autoLoraSettings(
         current.length,
         current.reduce((s, c) => s + c.duration, 0),
@@ -190,8 +225,14 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
     } catch (e) {
       setPipelineErr((e as Error).message);
     } finally {
-      setTraining(false); setPipelineStep(null);
+      setTraining(false);
+      setPipelineStep(null);
+      setPipelineAborted(false);
     }
+  }
+
+  function abortPipeline() {
+    setPipelineAborted(true);
   }
 
   async function signConsent() {
@@ -301,6 +342,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
       {tab === "training" && (
         <TrainingTab
           jobs={jobs}
+          ppStatus={ppStatus}
           auto={auto}
           useAuto={useAuto} setUseAuto={setUseAuto}
           epochs={effEpochs} setEpochs={setEpochs}
@@ -311,6 +353,7 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
           gpuKind={sys.data?.gpu.kind ?? "cpu"}
           onTrain={trainOnAll}
           onTrainQuick={startTraining}
+          onAbortPipeline={abortPipeline}
           training={training}
           pipelineStep={pipelineStep}
           pipelineErr={pipelineErr}
@@ -681,13 +724,15 @@ function ClipRow({ clip, onChange }: { clip: Clip; onChange: () => void }) {
 /* ---------------- TRAINING TAB ---------------- */
 
 function TrainingTab({
-  jobs, auto, useAuto, setUseAuto,
+  jobs, ppStatus, auto, useAuto, setUseAuto,
   epochs, setEpochs, rank, setRank, lr, setLr,
   device, setDevice, devices, gpuKind,
-  onTrain, onTrainQuick, training, pipelineStep, pipelineErr,
+  onTrain, onTrainQuick, onAbortPipeline,
+  training, pipelineStep, pipelineErr,
   clipsCount, rawCount,
 }: {
   jobs: SWRPair<Job[]>;
+  ppStatus: SWRPair<{ status: string; progress: number; log: string; n_input: number; n_output: number }>;
   auto: ReturnType<typeof autoLoraSettings>;
   useAuto: boolean; setUseAuto: (v: boolean) => void;
   epochs: number; setEpochs: (v: number) => void;
@@ -698,6 +743,7 @@ function TrainingTab({
   gpuKind: string;
   onTrain: () => void;
   onTrainQuick: () => void;
+  onAbortPipeline: () => void;
   training: boolean;
   pipelineStep: null | "preprocessing" | "waiting" | "starting";
   pipelineErr: string | null;
@@ -792,14 +838,53 @@ function TrainingTab({
           </div>
 
           {pipelineErr && (
-            <p className="text-xs text-red-400 mt-3">{pipelineErr}</p>
+            <div className="mt-3 p-2 rounded border border-red-700/40 bg-red-950/30">
+              <p className="text-xs text-red-300 break-words">{pipelineErr}</p>
+            </div>
           )}
           {pipelineStep && (
-            <p className="text-xs text-[var(--color-muted)] mt-3">
-              Pipeline: <span className="text-white">{pipelineStep}</span>
-            </p>
+            <div className="mt-3 p-2 rounded border border-[var(--color-border)] bg-[var(--color-bg)]">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-[var(--color-muted)]">
+                  Pipeline: <span className="text-white">{pipelineStep}</span>
+                </span>
+                <button
+                  onClick={onAbortPipeline}
+                  className="text-amber-400 hover:text-amber-300"
+                >Cancel</button>
+              </div>
+            </div>
           )}
         </Card>
+
+        {/* Inline preprocess status — shown whenever pipeline is waiting OR preprocess has any status */}
+        {ppStatus.data && ppStatus.data.status !== "idle" && (
+          <Card>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-sm font-semibold">Preprocess</h3>
+              <span className={`text-xs px-2 py-0.5 rounded-full ${badge(ppStatus.data.status)}`}>
+                {ppStatus.data.status}
+              </span>
+            </div>
+            <div className="text-xs text-[var(--color-muted)] mb-2">
+              files: {ppStatus.data.n_input} · clips: {ppStatus.data.n_output} · {Math.round(ppStatus.data.progress * 100)}%
+            </div>
+            <div className="h-1.5 bg-[var(--color-bg)] rounded mb-3">
+              <div
+                className="h-1.5 bg-[var(--color-accent)] rounded transition-all"
+                style={{ width: `${Math.round(ppStatus.data.progress * 100)}%` }}
+              />
+            </div>
+            <details open={ppStatus.data.status === "running" || ppStatus.data.status === "failed"}>
+              <summary className="text-xs text-[var(--color-muted)] hover:text-white cursor-pointer">
+                Log · {(ppStatus.data.log.match(/\n/g)?.length ?? 0)} lines
+              </summary>
+              <pre className="mt-2 text-[10px] text-[var(--color-muted)] max-h-80 overflow-auto whitespace-pre-wrap font-mono bg-[var(--color-bg)] rounded p-2">
+                {ppStatus.data.log || "—"}
+              </pre>
+            </details>
+          </Card>
+        )}
       </div>
 
       {/* Job history */}
