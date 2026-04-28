@@ -5,10 +5,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import librosa
+import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
 import torch
-import torchaudio
 from sqlalchemy import delete
 
 from app.core.config import settings
@@ -43,24 +44,28 @@ def _denoise(in_path: Path, work: Path) -> Path:
     out = work / "demucs"
     out.mkdir(parents=True, exist_ok=True)
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["python", "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
              "-o", str(out), str(in_path)],
-            check=True, capture_output=True,
+            check=True, capture_output=True, text=True,
         )
         cleaned = out / "htdemucs" / in_path.stem / "vocals.wav"
         return cleaned if cleaned.exists() else in_path
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        msg = getattr(e, "stderr", "") or str(e)
+        print(f"[preprocess] denoise skipped for {in_path.name}: {msg[-300:]}")
         return in_path
 
 
 def _to_mono_24k(path: Path) -> torch.Tensor:
-    wav, sr = torchaudio.load(str(path))
-    if wav.shape[0] > 1:
-        wav = wav.mean(0, keepdim=True)
-    if sr != SR:
-        wav = torchaudio.functional.resample(wav, sr, SR)
-    return wav.squeeze(0).float()
+    """Load any audio file -> mono float32 tensor at SR.
+
+    Uses librosa, which falls back through soundfile (WAV/FLAC/OGG native) and
+    audioread (mp3/m4a/aac via ffmpeg if installed). Avoids torchaudio 2.7+'s
+    new torchcodec-only default backend.
+    """
+    arr, _ = librosa.load(str(path), sr=SR, mono=True)
+    return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
 
 
 def _vad_segments(wav: torch.Tensor) -> list[tuple[int, int]]:
