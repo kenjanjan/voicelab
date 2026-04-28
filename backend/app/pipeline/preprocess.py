@@ -14,7 +14,7 @@ import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
 import torch
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 
 from app.core.config import settings
 from app.db import AudioClip, SessionLocal
@@ -152,12 +152,35 @@ def _normalize(wav: torch.Tensor) -> torch.Tensor:
     return wav * (10 ** (gain / 20))
 
 
-def preprocess_creator(creator_id: str) -> dict:
+def _clip_path_prefix(creator_id: str, raw_stem: str) -> str:
+    """SQL/path prefix for clips derived from a given raw file."""
+    return f"processed/{creator_id}/{raw_stem}_"
+
+
+def _wipe_partial_for_file(creator_id: str, out_dir: Path, raw_stem: str) -> None:
+    """Delete any clip files + DB rows derived from this raw file (partial earlier run)."""
+    for f in out_dir.glob(f"{raw_stem}_*.wav"):
+        f.unlink(missing_ok=True)
+    prefix = _clip_path_prefix(creator_id, raw_stem)
+    with SessionLocal() as db:
+        db.execute(
+            delete(AudioClip).where(
+                AudioClip.creator_id == creator_id,
+                AudioClip.path.like(prefix + "%"),
+            )
+        )
+        db.commit()
+
+
+def preprocess_creator(creator_id: str, force: bool = False) -> dict:
+    """Resumable preprocess. Each raw file gets a marker once fully committed.
+    On retry, files with markers are skipped. `force=True` wipes everything first."""
     raw_dir = settings.DATA_DIR / "raw" / creator_id
     out_dir = settings.DATA_DIR / "processed" / creator_id
     work_dir = out_dir / "_work"
+    completed_dir = out_dir / "_completed"
 
-    if out_dir.exists():
+    if force and out_dir.exists():
         for sub in out_dir.iterdir():
             if sub.name == "_status.json":
                 continue
@@ -165,17 +188,49 @@ def preprocess_creator(creator_id: str) -> dict:
                 shutil.rmtree(sub, ignore_errors=True)
             else:
                 sub.unlink(missing_ok=True)
+        with SessionLocal() as db:
+            db.execute(delete(AudioClip).where(AudioClip.creator_id == creator_id))
+            db.commit()
+
     out_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+    completed_dir.mkdir(parents=True, exist_ok=True)
 
     raw_files = sorted([p for p in raw_dir.iterdir() if p.is_file()]) if raw_dir.exists() else []
+
+    # Resume detection
+    pending: list[Path] = []
+    already_done: list[str] = []
+    for raw in raw_files:
+        if (completed_dir / raw.name).exists():
+            already_done.append(raw.name)
+        else:
+            pending.append(raw)
+
+    # Initial status: progress accounts for already-done files
+    n_total = len(raw_files)
+    n_done = len(already_done)
+    initial_progress = n_done / n_total if n_total else 0.0
+
+    # Count clips already in DB so n_output starts correctly
+    with SessionLocal() as db:
+        existing_count = db.execute(
+            select(func.count()).select_from(AudioClip)
+            .where(AudioClip.creator_id == creator_id)
+        ).scalar_one()
+
     _write_status(
-        creator_id, status="running", progress=0.0, log="",
-        n_input=len(raw_files), n_output=0,
+        creator_id, status="running",
+        progress=initial_progress, log="",
+        n_input=n_total, n_output=int(existing_count),
         started_at=datetime.utcnow().isoformat() + "Z",
         finished_at=None,
     )
-    _log(creator_id, f"Starting preprocess of {len(raw_files)} files (SR={SR} Hz)")
+    _log(
+        creator_id,
+        f"Starting preprocess. Total={n_total}, already_done={n_done}, pending={len(pending)} "
+        f"(force={force}, SR={SR}Hz)",
+    )
 
     if not raw_files:
         _log(creator_id, "No raw files to process.")
@@ -184,6 +239,14 @@ def preprocess_creator(creator_id: str) -> dict:
             finished_at=datetime.utcnow().isoformat() + "Z",
         )
         return {"clips": 0}
+
+    if not pending:
+        _log(creator_id, "All files already processed. Pass force=true to redo.")
+        _write_status(
+            creator_id, status="completed", progress=1.0,
+            finished_at=datetime.utcnow().isoformat() + "Z",
+        )
+        return {"clips": int(existing_count)}
 
     try:
         asr = _load_asr()
@@ -196,84 +259,99 @@ def preprocess_creator(creator_id: str) -> dict:
         )
         raise
 
-    new_clips: list[AudioClip] = []
     n_files_failed = 0
+    n_clips_total = int(existing_count)
 
-    for idx, raw in enumerate(raw_files):
-        _log(creator_id, f"[{idx+1}/{len(raw_files)}] {raw.name} ({raw.stat().st_size/1e6:.1f} MB)")
+    for idx, raw in enumerate(pending):
+        position = n_done + idx + 1
+        _log(creator_id, f"[{position}/{n_total}] {raw.name} ({raw.stat().st_size/1e6:.1f} MB)")
+
+        # Wipe any partial work from a previous failed run on THIS raw file
+        _wipe_partial_for_file(creator_id, out_dir, raw.stem)
+
         try:
             cleaned = _denoise(raw, work_dir)
-        except Exception as e:
-            _log(creator_id, f"  denoise error (continuing on raw): {e}")
+        except Exception as ex:
+            _log(creator_id, f"  denoise error (continuing on raw): {ex}")
             cleaned = raw
 
         try:
             wav = _to_mono_24k(cleaned)
-        except Exception as e:
-            _log(creator_id, f"  load FAILED: {e}")
+        except Exception as ex:
+            _log(creator_id, f"  load FAILED: {ex}")
             n_files_failed += 1
             continue
 
         total_dur = len(wav) / SR
         try:
             segs = _vad_segments(wav)
-        except Exception as e:
-            _log(creator_id, f"  VAD FAILED: {e}\n{traceback.format_exc()}")
+        except Exception as ex:
+            _log(creator_id, f"  VAD FAILED: {ex}\n{traceback.format_exc()}")
             n_files_failed += 1
             continue
 
+        file_clips: list[AudioClip] = []
         n_dropped = 0
-        n_saved = 0
-        for i, (s, e) in enumerate(segs):
-            seg = wav[s:e]
-            dur = (e - s) / SR
-            if dur < MIN_DUR:
-                n_dropped += 1
-                continue
-            seg = _normalize(seg)
-            clip_path = out_dir / f"{raw.stem}_{i:03}.wav"
-            sf.write(str(clip_path), seg.numpy(), SR, subtype="PCM_16")
-            text = ""
-            try:
-                segments, _info = asr.transcribe(
-                    str(clip_path), language="en", vad_filter=False,
-                )
-                text = " ".join(seg_.text.strip() for seg_ in segments)
-            except Exception as ex:
-                _log(creator_id, f"  ASR error on segment {i}: {ex}")
-            new_clips.append(AudioClip(
-                creator_id=creator_id,
-                path=str(clip_path.relative_to(settings.DATA_DIR).as_posix()),
-                text=text,
-                duration=round(dur, 2),
-                is_reference=False,
-            ))
-            n_saved += 1
+
+        try:
+            for i, (s, e) in enumerate(segs):
+                seg = wav[s:e]
+                dur = (e - s) / SR
+                if dur < MIN_DUR:
+                    n_dropped += 1
+                    continue
+                seg = _normalize(seg)
+                clip_path = out_dir / f"{raw.stem}_{i:03}.wav"
+                sf.write(str(clip_path), seg.numpy(), SR, subtype="PCM_16")
+                text = ""
+                try:
+                    segments, _info = asr.transcribe(
+                        str(clip_path), language="en", vad_filter=False,
+                    )
+                    text = " ".join(seg_.text.strip() for seg_ in segments)
+                except Exception as ex:
+                    _log(creator_id, f"  ASR error on segment {i}: {ex}")
+                file_clips.append(AudioClip(
+                    creator_id=creator_id,
+                    path=str(clip_path.relative_to(settings.DATA_DIR).as_posix()),
+                    text=text,
+                    duration=round(dur, 2),
+                    is_reference=False,
+                ))
+        except Exception as ex:
+            _log(creator_id, f"  segment loop FAILED: {ex}")
+            # Don't mark complete; partial files will be wiped on next retry.
+            n_files_failed += 1
+            continue
+
+        # Commit this file's clips atomically + write completion marker
+        with SessionLocal() as db:
+            for c in file_clips:
+                db.add(c)
+            db.commit()
+        (completed_dir / raw.name).touch()
+        n_clips_total += len(file_clips)
 
         _log(
             creator_id,
             f"  duration={total_dur:.1f}s · VAD found {len(segs)} segments · "
-            f"saved {n_saved} · dropped {n_dropped} (<{MIN_DUR}s)",
+            f"saved {len(file_clips)} · dropped {n_dropped} (<{MIN_DUR}s) · committed",
         )
         _write_status(
-            creator_id, progress=(idx + 1) / len(raw_files), n_output=len(new_clips),
+            creator_id,
+            progress=position / n_total,
+            n_output=n_clips_total,
         )
 
     shutil.rmtree(work_dir, ignore_errors=True)
 
-    with SessionLocal() as db:
-        db.execute(delete(AudioClip).where(AudioClip.creator_id == creator_id))
-        for c in new_clips:
-            db.add(c)
-        db.commit()
-
     _log(
         creator_id,
-        f"DONE — {len(new_clips)} clips written from {len(raw_files)} files "
-        f"({n_files_failed} failed).",
+        f"DONE — {n_clips_total} total clips · {len(pending) - n_files_failed}/{len(pending)} "
+        f"new files committed · {n_done} skipped (already done) · {n_files_failed} failed.",
     )
     _write_status(
-        creator_id, status="completed", progress=1.0, n_output=len(new_clips),
+        creator_id, status="completed", progress=1.0, n_output=n_clips_total,
         finished_at=datetime.utcnow().isoformat() + "Z",
     )
-    return {"clips": len(new_clips)}
+    return {"clips": n_clips_total}

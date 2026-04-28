@@ -166,8 +166,8 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   const effRank = useAuto ? auto.rank : rank;
   const effLr = useAuto ? auto.lr : lr;
 
-  async function preprocess() {
-    await api.preprocess(id);
+  async function preprocess(force = false) {
+    await api.preprocess(id, force);
     setTimeout(() => { clips.mutate(); raw.mutate(); ppStatus.mutate(); }, 1000);
   }
 
@@ -491,7 +491,7 @@ function DatasetTab({
   ppStatus: SWRPair<{ status: string; progress: number; log: string; n_input: number; n_output: number }>;
   ppRunning: boolean;
   totalRawSize: number;
-  onPreprocess: () => void;
+  onPreprocess: (force?: boolean) => void;
   onResetPreprocess: () => Promise<void>;
 }) {
   return (
@@ -534,16 +534,29 @@ function DatasetTab({
               </ul>
             </div>
           )}
-          <div className="mt-3 pt-3 border-t border-[var(--color-border)]">
-            <Button
-              variant="secondary"
-              onClick={onPreprocess}
-              disabled={!raw.data || raw.data.length === 0 || ppRunning}
-            >
-              {ppRunning ? "Preprocessing…" : "Run preprocessing"}
-            </Button>
-            <p className="text-xs text-[var(--color-muted)] mt-2">
-              denoise → 24kHz mono → VAD → loudness norm → ASR
+          <div className="mt-3 pt-3 border-t border-[var(--color-border)] space-y-2">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="secondary"
+                onClick={() => onPreprocess(false)}
+                disabled={!raw.data || raw.data.length === 0 || ppRunning}
+              >
+                {ppRunning ? "Preprocessing…" : "Run / resume preprocessing"}
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  if (confirm("Wipe ALL processed clips for this creator and start over from scratch? Existing clips and references will be deleted.")) {
+                    onPreprocess(true);
+                  }
+                }}
+                disabled={!raw.data || raw.data.length === 0 || ppRunning}
+              >
+                Restart from scratch
+              </Button>
+            </div>
+            <p className="text-xs text-[var(--color-muted)]">
+              Resume skips files already fully processed. A failed/killed run leaves partial files — those get cleanly redone on the next "Run / resume". "Restart from scratch" wipes everything.
             </p>
           </div>
         </Card>

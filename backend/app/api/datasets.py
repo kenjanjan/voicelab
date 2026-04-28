@@ -116,13 +116,14 @@ def reset_preprocess_status(creator_id: str, db: Session = Depends(get_session))
 def trigger_preprocess(
     creator_id: str,
     bg: BackgroundTasks,
+    force: bool = False,
     db: Session = Depends(get_session),
 ) -> dict:
     creator = db.get(Creator, creator_id)
     if not creator:
         raise HTTPException(404, "Creator not found")
-    bg.add_task(preprocess_creator, creator_id)
-    return {"status": "started"}
+    bg.add_task(preprocess_creator, creator_id, force)
+    return {"status": "started", "force": force}
 
 
 @router.get("/{creator_id}/clips", response_model=list[ClipOut])

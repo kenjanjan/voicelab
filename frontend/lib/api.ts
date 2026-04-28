@@ -52,8 +52,11 @@ export const api = {
       .then((r) => { if (!r.ok && r.status !== 204) throw new Error(`${r.status}`); }),
 
   listClips: (id: string) => req<Clip[]>(`/api/datasets/${id}/clips`),
-  preprocess: (id: string) =>
-    req<{ status: string }>(`/api/datasets/${id}/preprocess`, { method: "POST" }),
+  preprocess: (id: string, force = false) =>
+    req<{ status: string }>(
+      `/api/datasets/${id}/preprocess${force ? "?force=true" : ""}`,
+      { method: "POST" },
+    ),
   preprocessStatus: (id: string) =>
     req<{
       status: string; progress: number; log: string;
