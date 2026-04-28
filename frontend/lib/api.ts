@@ -40,6 +40,12 @@ export const api = {
   signConsent: (id: string) =>
     req<Creator>(`/api/creators/${id}/consent`, { method: "PATCH" }),
 
+  listRaw: (id: string) =>
+    req<{ name: string; size: number }[]>(`/api/datasets/${id}/raw`),
+  deleteRaw: (id: string, name: string) =>
+    fetch(`/api/datasets/${id}/raw/${encodeURIComponent(name)}`, { method: "DELETE" })
+      .then((r) => { if (!r.ok && r.status !== 204) throw new Error(`${r.status}`); }),
+
   listClips: (id: string) => req<Clip[]>(`/api/datasets/${id}/clips`),
   preprocess: (id: string) =>
     req<{ status: string }>(`/api/datasets/${id}/preprocess`, { method: "POST" }),

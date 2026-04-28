@@ -5,15 +5,64 @@ import useSWR from "swr";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { UploadDropzone } from "@/components/upload-dropzone";
-import { api, Clip, Creator, Job } from "@/lib/api";
+import { api, Clip, Creator, Job, SystemStatus } from "@/lib/api";
 
 const EMOTIONS = ["casual", "flirty", "seductive", "excited", "playful_giggle", "soft_intimate"];
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function autoLoraSettings(
+  nClips: number, totalSec: number, vramGb: number | null, gpuKind: string,
+): { rank: number; epochs: number; lr: number; reason: string; warn?: string } {
+  let rank: number;
+  if (gpuKind !== "cuda") rank = 4;
+  else if (vramGb == null) rank = 8;
+  else if (vramGb <= 6) rank = 8;
+  else if (vramGb <= 10) rank = 12;
+  else rank = 16;
+
+  let epochs: number;
+  if (nClips === 0) epochs = 8;
+  else if (nClips >= 4000) epochs = 1;
+  else if (nClips >= 1500) epochs = 2;
+  else if (nClips >= 600) epochs = 4;
+  else if (nClips >= 250) epochs = 8;
+  else if (nClips >= 100) epochs = 12;
+  else epochs = 15;
+
+  const lr = nClips < 50 ? 5e-5 : nClips > 1500 ? 1.5e-4 : 1e-4;
+
+  const minutes = Math.round(totalSec / 60);
+  const totalSteps = nClips * epochs;
+  const reason =
+    `${nClips} clips · ~${minutes} min audio · ` +
+    (gpuKind === "cuda" ? `${vramGb ?? "?"} GB VRAM`
+      : gpuKind === "mps" ? "Apple MPS" : "CPU only") +
+    ` → ${epochs} epochs × rank ${rank} ≈ ${totalSteps.toLocaleString()} steps, lr ${lr.toExponential(0)}`;
+
+  let warn: string | undefined;
+  if (nClips > 3000) {
+    warn = "Large dataset — voice cloning saturates around 1–2 hr; consider subsampling to your best ~1 500 clips for similar or better quality.";
+  } else if (nClips < 50 && nClips > 0) {
+    warn = "Small dataset — quality may be poor. Aim for at least 100 clips (~15 min processed audio).";
+  }
+
+  return { rank, epochs, lr, reason, warn };
+}
 
 export default function CreatorDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
 
   const creator = useSWR<Creator>(`/api/creators/${id}`, () =>
     fetch(`/api/creators/${id}`).then((r) => r.json()),
+  );
+  const raw = useSWR<{ name: string; size: number }[]>(
+    `/api/datasets/${id}/raw`, () => api.listRaw(id), { refreshInterval: 4000 },
   );
   const clips = useSWR<Clip[]>(`/api/datasets/${id}/clips`, () => api.listClips(id), {
     refreshInterval: 4000,
@@ -22,9 +71,27 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
     refreshInterval: 3000,
   });
 
+  const sys = useSWR<SystemStatus>("/api/system/status", api.systemStatus);
+
+  const totalRawSize = (raw.data ?? []).reduce((s, f) => s + f.size, 0);
+  const totalClipSec = (clips.data ?? []).reduce((s, c) => s + c.duration, 0);
+
+  const auto = autoLoraSettings(
+    clips.data?.length ?? 0,
+    totalClipSec,
+    sys.data?.gpu.vram_gb ?? null,
+    sys.data?.gpu.kind ?? "cpu",
+  );
+
   const [training, setTraining] = useState(false);
+  const [useAuto, setUseAuto] = useState(true);
   const [epochs, setEpochs] = useState(8);
-  const [rank, setRank] = useState(16);
+  const [rank, setRank] = useState(8);
+  const [lr, setLr] = useState(1e-4);
+
+  const effEpochs = useAuto ? auto.epochs : epochs;
+  const effRank = useAuto ? auto.rank : rank;
+  const effLr = useAuto ? auto.lr : lr;
 
   async function preprocess() {
     await api.preprocess(id);
@@ -34,7 +101,9 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
   async function startTraining() {
     setTraining(true);
     try {
-      await api.startTraining(id, { epochs, learning_rate: 1e-4, rank });
+      await api.startTraining(id, {
+        epochs: effEpochs, learning_rate: effLr, rank: effRank,
+      });
       await jobs.mutate();
     } finally {
       setTraining(false);
@@ -76,11 +145,49 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
 
       <Card>
         <CardTitle>Upload audio</CardTitle>
-        <UploadDropzone creatorId={id} onDone={() => clips.mutate()} />
-        <div className="flex gap-3 mt-4">
-          <Button variant="secondary" onClick={preprocess}>Run preprocessing</Button>
-          <span className="text-xs text-[var(--color-muted)] self-center">
-            denoise → 24k mono → VAD → loudness norm → ASR
+        <UploadDropzone creatorId={id} onDone={() => { raw.mutate(); clips.mutate(); }} />
+      </Card>
+
+      <Card>
+        <CardTitle>
+          Uploaded files ({raw.data?.length ?? 0}
+          {raw.data && raw.data.length > 0 ? ` · ${fmtBytes(totalRawSize)}` : ""})
+        </CardTitle>
+        {!raw.data || raw.data.length === 0 ? (
+          <p className="text-sm text-[var(--color-muted)]">
+            No raw files yet. Drop audio above.
+          </p>
+        ) : (
+          <ul className="divide-y divide-[var(--color-border)] text-sm">
+            {raw.data.map((f) => (
+              <li key={f.name} className="flex items-center justify-between py-1.5">
+                <span className="font-mono truncate flex-1 mr-3">{f.name}</span>
+                <span className="text-[var(--color-muted)] w-24 text-right">{fmtBytes(f.size)}</span>
+                <button
+                  onClick={async () => {
+                    if (!confirm(`Delete ${f.name}?`)) return;
+                    await api.deleteRaw(id, f.name);
+                    raw.mutate();
+                  }}
+                  className="ml-3 text-[var(--color-muted)] hover:text-red-400 px-2"
+                  title="Delete file"
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex flex-wrap items-center gap-3 mt-4 pt-4 border-t border-[var(--color-border)]">
+          <Button
+            variant="secondary"
+            onClick={preprocess}
+            disabled={!raw.data || raw.data.length === 0}
+          >
+            Run preprocessing
+          </Button>
+          <span className="text-xs text-[var(--color-muted)]">
+            denoise → 24 kHz mono → VAD → loudness norm → ASR. Re-running replaces all clips for this creator.
           </span>
         </div>
       </Card>
@@ -165,23 +272,50 @@ export default function CreatorDetail({ params }: { params: Promise<{ id: string
       </Card>
 
       <Card>
-        <CardTitle>LoRA training</CardTitle>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-base font-semibold">LoRA training</h2>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox" checked={useAuto}
+              onChange={(e) => setUseAuto(e.target.checked)}
+            />
+            <span className={useAuto ? "text-[var(--color-accent)]" : "text-[var(--color-muted)]"}>
+              Auto settings
+            </span>
+          </label>
+        </div>
+
+        <p className="text-xs text-[var(--color-muted)] mb-2">{auto.reason}</p>
+        {auto.warn && (
+          <p className="text-xs text-amber-400 mb-4">{auto.warn}</p>
+        )}
+
         <div className="flex flex-wrap items-end gap-4 mb-4">
           <label className="text-sm">
             <div className="text-[var(--color-muted)] mb-1">Epochs</div>
-            <input type="number" value={epochs} min={1} max={50}
+            <input
+              type="number" value={effEpochs} min={1} max={50} disabled={useAuto}
               onChange={(e) => setEpochs(parseInt(e.target.value))}
-              className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-20"
+              className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-20 disabled:opacity-60"
             />
           </label>
           <label className="text-sm">
             <div className="text-[var(--color-muted)] mb-1">Rank</div>
-            <input type="number" value={rank} min={4} max={64}
+            <input
+              type="number" value={effRank} min={4} max={64} disabled={useAuto}
               onChange={(e) => setRank(parseInt(e.target.value))}
-              className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-20"
+              className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-20 disabled:opacity-60"
             />
           </label>
-          <Button onClick={startTraining} disabled={training}>
+          <label className="text-sm">
+            <div className="text-[var(--color-muted)] mb-1">Learning rate</div>
+            <input
+              type="number" value={effLr} min={1e-5} max={5e-4} step={1e-5} disabled={useAuto}
+              onChange={(e) => setLr(parseFloat(e.target.value))}
+              className="bg-[var(--color-bg)] border border-[var(--color-border)] rounded px-2 py-1 w-28 disabled:opacity-60"
+            />
+          </label>
+          <Button onClick={startTraining} disabled={training || (clips.data?.length ?? 0) < 20}>
             {training ? "Starting…" : "Start training"}
           </Button>
         </div>

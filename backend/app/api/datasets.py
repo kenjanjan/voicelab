@@ -23,6 +23,11 @@ class ClipOut(BaseModel):
     is_reference: bool
 
 
+class RawFileOut(BaseModel):
+    name: str
+    size: int
+
+
 class ClipPatch(BaseModel):
     emotion: str | None = None
     is_reference: bool | None = None
@@ -53,6 +58,33 @@ def upload_audio(
         saved.append(target.name)
 
     return {"saved": saved, "count": len(saved)}
+
+
+@router.get("/{creator_id}/raw", response_model=list[RawFileOut])
+def list_raw(creator_id: str, db: Session = Depends(get_session)) -> list[RawFileOut]:
+    creator = db.get(Creator, creator_id)
+    if not creator:
+        raise HTTPException(404, "Creator not found")
+    raw_dir = settings.DATA_DIR / "raw" / creator_id
+    if not raw_dir.exists():
+        return []
+    out: list[RawFileOut] = []
+    for p in sorted(raw_dir.iterdir()):
+        if p.is_file():
+            out.append(RawFileOut(name=p.name, size=p.stat().st_size))
+    return out
+
+
+@router.delete("/{creator_id}/raw/{filename}", status_code=204)
+def delete_raw(creator_id: str, filename: str, db: Session = Depends(get_session)) -> None:
+    creator = db.get(Creator, creator_id)
+    if not creator:
+        raise HTTPException(404, "Creator not found")
+    raw_dir = settings.DATA_DIR / "raw" / creator_id
+    target = raw_dir / Path(filename).name
+    if not target.is_file() or target.parent.resolve() != raw_dir.resolve():
+        raise HTTPException(404, "File not found")
+    target.unlink()
 
 
 @router.post("/{creator_id}/preprocess")
